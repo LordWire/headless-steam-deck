@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# steamremote — headless Steam inside gamescope, for Remote Play to a Steam Deck.
+# User space only: no systemd unit, no polkit rule, no root.
+set -uo pipefail
+
+GAMESCOPE=/usr/bin/gamescope
+STEAM=/usr/bin/steam
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/steamremote"
+LOG_FILE="$STATE_DIR/run.log"
+PID_FILE="$STATE_DIR/gamescope.pid"
+
+WIDTH="${GAMESCOPE_WIDTH:-1280}"
+HEIGHT="${GAMESCOPE_HEIGHT:-1024}"
+REFRESH="${GAMESCOPE_REFRESH:-60}"
+CAP="${GAMESCOPE_CAP:-2h}"
+
+die() { echo "$*" >&2; exit 1; }
+
+# The session leader is also the process-group id, so one signal reaches
+# gamescope, the reaper, Steam and the game.
+leader() {
+    local pid
+    [[ -r $PID_FILE ]] || return 1
+    pid=$(<"$PID_FILE") || return 1
+    [[ -n $pid ]] || return 1
+    # A session can end without `stop` — runtime cap, crash, OOM kill — which
+    # leaves this file behind. Probing the number alone is not enough, because a
+    # recycled PID would look like a live session and block every later launch.
+    if ! kill -0 "$pid" 2>/dev/null ||
+        ! grep -qa gamescope "/proc/$pid/cmdline" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        return 1
+    fi
+    echo "$pid"
+}
+
+start() {
+    local cap="${1:-$CAP}" wrapper=()
+    mkdir -p "$STATE_DIR"
+
+    pgrep -u "$USER" -x kwin_wayland >/dev/null 2>&1 &&
+        die "Your desktop session is running. Log out of the workstation first — local and remote use are mutually exclusive."
+
+    leader >/dev/null 2>&1 &&
+        die "Already running (pid $(leader)). Use: steamremote stop"
+
+    if [[ $cap == none || $cap == off || $cap == 0 ]]; then
+        cap=""
+        echo "Starting headless Steam ${WIDTH}x${HEIGHT}@${REFRESH}, no runtime limit …"
+    else
+        wrapper=(timeout -k 30 "$cap")
+        echo "Starting headless Steam ${WIDTH}x${HEIGHT}@${REFRESH}, self-stops after ${cap} …"
+    fi
+
+    setsid nohup "${wrapper[@]}" "$GAMESCOPE" \
+        --backend headless \
+        -W "$WIDTH" -H "$HEIGHT" -w "$WIDTH" -h "$HEIGHT" -r "$REFRESH" \
+        --steam \
+        -- "$STEAM" -tenfoot -gamepadui -pipewire -pipewire-dmabuf \
+        >>"$LOG_FILE" 2>&1 </dev/null &
+
+    local pid=$!
+    echo "$pid" >"$PID_FILE"
+    disown
+
+    sleep 5
+    kill -0 "$pid" 2>/dev/null || {
+        echo "Failed to stay running. Last 30 log lines:"
+        tail -n 30 "$LOG_FILE"
+        rm -f "$PID_FILE"
+        exit 1
+    }
+    echo "Running (pid $pid). Connect from your Deck."
+    echo "Log: $LOG_FILE"
+    echo "Stop: steamremote stop"
+}
+
+stop() {
+    local pid
+    leader >/dev/null 2>&1 || { echo "Not running."; rm -f "$PID_FILE"; return 0; }
+    pid=$(leader)
+    echo "Stopping the headless session (pid $pid) …"
+    kill -TERM -- "-$pid" 2>/dev/null
+
+    for _ in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Still alive, forcing."
+        kill -KILL -- "-$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+
+    local stray
+    for stray in steam steamwebhelper gamescope-wl; do
+        if pgrep -u "$USER" -x "$stray" >/dev/null 2>&1; then
+            echo "Cleaning up leftover: $stray"
+            pkill -u "$USER" -x "$stray" 2>/dev/null
+        fi
+    done
+    echo "Done."
+}
+
+status() {
+    if leader >/dev/null 2>&1; then
+        echo "Running — session leader $(leader)"
+        ps -o pid,etime,rss,comm -u "$USER" 2>/dev/null |
+            grep -E "gamescope|steam" | head -8
+        ss -lun 2>/dev/null | grep -q ':27036 ' &&
+            echo "Remote Play is reachable on UDP 27036." ||
+            echo "WARNING: nothing is listening on UDP 27036."
+    else
+        echo "Not running."
+    fi
+}
+
+case "${1:-launch}" in
+    launch | start) shift 2>/dev/null || true; start "${1:-}" ;;
+    stop) shift 2>/dev/null || true; stop ;;
+    status) shift 2>/dev/null || true; status ;;
+    logs) shift 2>/dev/null || true;
+        [[ -r $LOG_FILE ]] || die "No log yet at $LOG_FILE"
+        tail -n 40 -f "$LOG_FILE" ;;
+    *) echo "usage: steamremote [launch [duration]|stop|status|logs]"
+        echo "  duration: 90m, 2h (default), or 'none' to disable the auto-stop"
+        echo "  resolution: GAMESCOPE_WIDTH=1920 GAMESCOPE_HEIGHT=1080 steamremote launch"
+        exit 2 ;;
+esac
