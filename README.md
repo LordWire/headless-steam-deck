@@ -1,5 +1,7 @@
 # steamremote — headless Steam on Fedora for Steam Deck Remote Play
 
+![Vibe Coded](https://img.shields.io/badge/vibe_coded-100%25-a855f7?style=for-the-badge)
+
 Stream games from a Fedora desktop to a Steam Deck over Remote Play, **without
 logging in at the machine** and **without root**.
 
@@ -256,4 +258,5 @@ Fedora-specific encoding gotchas
 
 ## License
 
-Do whatever you like with it.
+MIT — do whatever you like with it, just keep the copyright notice. See
+[LICENSE](LICENSE).
